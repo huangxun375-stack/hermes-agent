@@ -211,6 +211,38 @@ class TestAssembly:
         assert view is not None and SUMMARY_HEADER in view[0]["content"]
 
 
+# ── rotation quiesce: background worker must not poison the new binding ─────
+
+
+class TestRotationQuiesce:
+    def test_session_start_joins_inflight_worker(self):
+        """A slow background ingest started under the OLD binding must finish
+        (or be joined) before a rebind — otherwise its old-list watermark
+        writes would poison the fresh session's watermark."""
+        import threading
+
+        eng = make_engine()
+        eng.on_session_start("old-root", lineage_root_id="old-root")
+        release = threading.Event()
+        started = threading.Event()
+
+        def slow_add(sid, role, text):
+            started.set()
+            assert release.wait(timeout=5), "test deadlock"
+
+        eng._client.add_message.side_effect = slow_add
+        eng.on_turn_complete(msgs("u", "a"), TurnInfo(session_id="old-root"))
+        assert started.wait(timeout=5)
+        # Rebind while the worker is mid-flight; release it from another
+        # thread so on_session_start's join can complete.
+        threading.Timer(0.2, release.set).start()
+        eng.on_session_start("new-root", boundary_reason="reset",
+                             lineage_root_id="new-root")
+        # Fresh binding has a clean watermark despite the in-flight worker.
+        assert eng._ingested_count == 0
+        assert eng._ov_sid == _safe_ov_session_id("new-root")
+
+
 # ── compaction degradation ───────────────────────────────────────────────────
 
 
@@ -228,6 +260,31 @@ class TestCompaction:
         assert SUMMARY_HEADER not in text          # degraded: no summary
         assert any(x.get("content") == "u1" for x in rebuilt)  # tail kept
         assert eng.compression_count == 1
+
+    def test_commit_exception_aborts_without_raising(self):
+        """Host contract: compress() must NEVER raise (compress_context
+        re-raises engine exceptions as fatal). OV-down -> sanctioned abort:
+        input returned unchanged + _last_compress_aborted set, which makes
+        the host skip session rotation cleanly."""
+        eng = make_engine()
+        eng.on_session_start("sess-a")
+        eng._client.commit.side_effect = RuntimeError("connection refused")
+        m = msgs("u1", "a1")
+        out = eng.compress(m)
+        assert out is m  # unchanged input object = host abort signal
+        assert eng._last_compress_aborted is True
+        assert eng.compression_count == 0
+
+    def test_successful_compress_clears_abort_flag(self):
+        eng = make_engine()
+        eng.on_session_start("sess-a")
+        eng._last_compress_aborted = True  # stale from a previous abort
+        eng._client.commit.return_value = {"task_id": "t-1"}
+        eng._client.get_task.return_value = {"status": "completed"}
+        eng._client.get_context.return_value = {
+            "latest_archive_overview": "the summary"}
+        eng.compress(msgs("u1", "a1"))
+        assert eng._last_compress_aborted is False
 
     def test_compress_rebuild_sets_watermark_past_window(self):
         eng = make_engine()

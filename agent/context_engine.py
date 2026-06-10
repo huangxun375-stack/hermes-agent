@@ -336,6 +336,12 @@ class ContextEngine(ABC):
         ``None`` (not an equivalent copy) when no change is needed, so the
         prompt-cache prefix stays byte-stable.
 
+        Shape contract: the host re-locates the current turn's user message
+        inside the returned view as the LAST ``role == "user"`` entry (for
+        its own ephemeral injections). Engines should therefore merge
+        injections into existing messages or keep the current user message
+        last — not append extra user-role entries after it.
+
         Capability gate: ``capabilities().request_assembly``.
         """
         return None

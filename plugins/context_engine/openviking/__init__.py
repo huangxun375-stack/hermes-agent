@@ -210,6 +210,10 @@ class OpenVikingContextEngine(ContextEngine):
         # half-opens after _CB_COOLDOWN_S.
         self._cb_failures = 0
         self._cb_open_until = 0.0
+        # Host abort contract: compress() must never raise; on failure it
+        # returns the input unchanged and sets this flag (the host then skips
+        # session rotation — see conversation_compression.py).
+        self._last_compress_aborted = False
         # Assembly cache: the tool loop re-runs request assembly on every
         # provider dispatch; the archive overview only changes on ingest /
         # commit. Cache it per short TTL and invalidate on writes.
@@ -282,6 +286,15 @@ class OpenVikingContextEngine(ContextEngine):
           context stays continuous, ingest watermark survives)
         - /new and /reset      -> fresh OV session (clean slate, as intended)
         """
+        # Quiesce the background ingest worker BEFORE rebinding: a worker
+        # started for the previous binding advances the shared watermark with
+        # OLD-list indices; letting it race past a rebind would poison the
+        # fresh session's watermark.
+        with self._bg_lock:
+            t = self._bg_thread
+        if t and t.is_alive():
+            t.join(timeout=10.0)
+
         self._session_id = session_id or ""
         anchor = kwargs.get("lineage_root_id") or session_id
         new_ov_sid = _safe_ov_session_id(anchor) if anchor else ""
@@ -481,10 +494,24 @@ class OpenVikingContextEngine(ContextEngine):
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None, focus_topic: str = None
                  ) -> List[Dict[str, Any]]:
+        # Failure semantics: the host treats a raised exception as fatal for
+        # the turn (compress_context releases the lock and RE-RAISES), while
+        # "return input unchanged + _last_compress_aborted" is the sanctioned
+        # abort path that skips session rotation cleanly. Never raise here.
+        self._last_compress_aborted = False
         if not self._ov_sid:
+            self._last_compress_aborted = True
             return messages
         self._invalidate_ctx_cache()
-        result = self._client.commit(self._ov_sid, keep_recent_count=0)
+        try:
+            result = self._client.commit(self._ov_sid, keep_recent_count=0)
+            self._cb_ok()
+        except Exception as e:
+            self._cb_fail()
+            logger.warning("openviking: compress commit failed — aborting "
+                           "compaction (no rotation): %s", e)
+            self._last_compress_aborted = True
+            return messages
         # Compaction must consume the commit's product (the archive overview),
         # so wait for the server task to terminate — rare, already-slow path.
         task_id = result.get("task_id")
@@ -511,6 +538,7 @@ class OpenVikingContextEngine(ContextEngine):
                             "content": "Understood — I have the session history summary."})
         rebuilt.extend(dict(m) for m in tail)
         if not rebuilt:
+            self._last_compress_aborted = True
             return messages
         self.compression_count += 1
         self.last_prompt_tokens = -1  # match built-in sentinel until next usage
