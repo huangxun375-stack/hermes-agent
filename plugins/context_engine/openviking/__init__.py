@@ -172,6 +172,9 @@ class _OVClient:
                              {"keep_recent_count": keep_recent_count},
                              timeout=180.0)
 
+    def get_task(self, task_id: str) -> dict:
+        return self._request("GET", f"/api/v1/tasks/{task_id}")
+
     def search(self, query: str, limit: int = 5) -> dict:
         return self._request("POST", "/api/v1/search/find",
                              {"query": query, "limit": limit}, timeout=60.0)
@@ -357,35 +360,55 @@ class OpenVikingContextEngine(ContextEngine):
         except Exception as e:
             logger.warning("openviking on_pre_compress flush failed: %s", e)
 
-    def _poll_overview(self, budget: int, timeout_s: float = 180.0,
-                       interval_s: float = 3.0) -> str:
-        """Poll until the archive overview is generated (server-side async)."""
+    def _wait_commit_task(self, task_id: str, timeout_s: float = 180.0,
+                          interval_s: float = 2.0) -> str:
+        """Client-side poll of the server commit task until it terminates.
+
+        The OV commit endpoint is async (returns ``accepted`` + ``task_id``;
+        the archive overview is produced by that server-side task). Same
+        client-side-poll semantics the OpenClaw plugin implements for
+        ``commitSession(wait=true)`` — there is no server wait parameter.
+        Polling the task (not the overview) gives a deterministic terminal
+        signal: ``failed`` stops immediately instead of waiting out a timeout.
+        """
         import time as _time
 
         deadline = _time.time() + timeout_s
         while _time.time() < deadline:
             try:
-                ov_ctx = self._client.get_context(self._ov_sid, budget)
-                overview = (ov_ctx.get("latest_archive_overview") or "").strip()
-                if overview:
-                    return overview
+                task = self._client.get_task(task_id)
+                status = (task.get("status") or "").lower()
+                if status in ("completed", "failed"):
+                    if status == "failed":
+                        logger.warning("openviking: commit task %s failed: %s",
+                                       task_id, task.get("error"))
+                    return status
             except Exception as e:
-                logger.debug("openviking: overview poll error: %s", e)
+                logger.debug("openviking: task poll error: %s", e)
             _time.sleep(interval_s)
-        return ""
+        logger.warning("openviking: commit task %s still running after %ss",
+                       task_id, timeout_s)
+        return "timeout"
 
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None, focus_topic: str = None
                  ) -> List[Dict[str, Any]]:
         if not self._ov_sid:
             return messages
-        self._client.commit(self._ov_sid, keep_recent_count=0)
-        # The overview is produced by the server-side commit task — poll it.
-        # Compaction is a rare, already-slow operation; waiting here is the
-        # same trade the OpenClaw plugin makes with commitSession(wait=true).
-        overview = self._poll_overview(self.threshold_tokens or 64_000)
+        result = self._client.commit(self._ov_sid, keep_recent_count=0)
+        # Compaction must consume the commit's product (the archive overview),
+        # so wait for the server task to terminate — rare, already-slow path.
+        task_id = result.get("task_id")
+        if task_id:
+            self._wait_commit_task(str(task_id))
+        overview = ""
+        try:
+            ov_ctx = self._client.get_context(self._ov_sid, self.threshold_tokens or 64_000)
+            overview = (ov_ctx.get("latest_archive_overview") or "").strip()
+        except Exception as e:
+            logger.warning("openviking: post-commit context fetch failed: %s", e)
         if not overview:
-            logger.warning("openviking: archive overview not ready after poll timeout")
+            logger.warning("openviking: archive overview unavailable — degraded rebuild (tail only)")
         tail = [m for m in messages if m.get("role") in ("user", "assistant")]
         tail = tail[-max(self.protect_last_n, 2):]
         # Drop a leading assistant message to keep user-first alternation.
