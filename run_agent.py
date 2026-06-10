@@ -530,6 +530,30 @@ class AIAgent:
                 "Session DB creation failed (will retry next turn): %s", e
             )
 
+    def _load_persisted_lineage_root(self, session_id: str) -> Optional[str]:
+        """Read the persisted lineage root for a session (None if unknown).
+
+        Storage: SessionDB meta kv (``lineage_root:<session_id>``). Keeps the
+        logical-conversation root stable across process restarts and resumes,
+        so context engines can re-bind continuously after compaction rotations.
+        """
+        try:
+            db = getattr(self, "_session_db", None)
+            if db and session_id:
+                return db.get_meta(f"lineage_root:{session_id}") or None
+        except Exception:
+            pass
+        return None
+
+    def _persist_lineage_root(self, session_id: str, root: Optional[str]) -> None:
+        """Persist session->lineage-root mapping (fail-open)."""
+        try:
+            db = getattr(self, "_session_db", None)
+            if db and session_id and root:
+                db.set_meta(f"lineage_root:{session_id}", root)
+        except Exception as exc:
+            logger.debug("lineage root persist failed for %s: %s", session_id, exc)
+
     def _transition_context_engine_session(
         self,
         *,
@@ -663,8 +687,11 @@ class AIAgent:
             **_lineage_extra,
         )
         # A reset starts a new logical conversation chain: regenerate the
-        # lineage root from the (possibly rotated) current session id.
+        # lineage root from the (possibly rotated) current session id and
+        # persist the new mapping.
         self._lineage_root_id = getattr(self, "session_id", None)
+        if self._lineage_root_id:
+            self._persist_lineage_root(self._lineage_root_id, self._lineage_root_id)
 
     def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
         """
