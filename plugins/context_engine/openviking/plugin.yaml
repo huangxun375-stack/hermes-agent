@@ -1,0 +1,2 @@
+name: openviking
+description: "OpenViking full context lifecycle engine — turn observation/ingest, archive-summary + recall request assembly, commit-based compaction, and memory search tools backed by an OpenViking server."
