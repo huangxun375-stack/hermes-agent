@@ -40,6 +40,7 @@ class TurnInfo:
     """
 
     session_id: str
+    turn_id: Optional[str] = None
     turn_index: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
     compressed_during_turn: bool = False
