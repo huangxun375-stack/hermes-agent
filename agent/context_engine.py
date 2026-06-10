@@ -298,7 +298,7 @@ class ContextEngine(ABC):
     # ``capabilities()`` keep the exact legacy call pattern (zero new calls).
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], turn: "TurnInfo") -> None:
-        """Read-only observation of a completed turn.
+        """Read-only observation of a completed turn (best-effort per turn).
 
         Called once per turn from ``finalize_turn`` (including interrupted
         turns — see ``turn.interrupted``), right before external-memory
@@ -306,6 +306,14 @@ class ContextEngine(ABC):
         compression may already have happened (``turn.compressed_during_turn``).
         Engines must not mutate the list; the return value is ignored.
         Heavy work must be queued for background processing.
+
+        Delivery contract — BEST-EFFORT, SELF-HEALING: error/interrupt paths
+        that exit ``run_conversation`` before ``finalize_turn`` skip this
+        hook for that turn. Because ``messages`` is always the FULL working
+        list, a skipped turn's content arrives with the next invocation (or
+        with ``on_session_end`` at the real session boundary). Ingestion
+        engines must therefore be watermark-idempotent: track what they have
+        already consumed and tolerate both re-delivery and gaps.
 
         Capability gate: ``capabilities().observation``.
         """

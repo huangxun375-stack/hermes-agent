@@ -204,6 +204,43 @@ class OpenVikingContextEngine(ContextEngine):
         self._ingested_count = 0
         self._bg_lock = threading.Lock()
         self._bg_thread: Optional[threading.Thread] = None
+        # Circuit breaker: when the OV server is unreachable, hooks must
+        # degrade FAST (pass through) instead of stalling every dispatch on
+        # HTTP timeouts. Opens after _CB_THRESHOLD consecutive failures,
+        # half-opens after _CB_COOLDOWN_S.
+        self._cb_failures = 0
+        self._cb_open_until = 0.0
+        # Assembly cache: the tool loop re-runs request assembly on every
+        # provider dispatch; the archive overview only changes on ingest /
+        # commit. Cache it per short TTL and invalidate on writes.
+        self._ctx_cache: Optional[tuple] = None  # (expires_at, overview)
+
+    _CB_THRESHOLD = 3
+    _CB_COOLDOWN_S = 60.0
+    _CTX_CACHE_TTL_S = 30.0
+
+    # ── circuit breaker ──────────────────────────────────────────────────
+
+    def _cb_allow(self) -> bool:
+        import time as _time
+        return _time.time() >= self._cb_open_until
+
+    def _cb_ok(self) -> None:
+        self._cb_failures = 0
+
+    def _cb_fail(self) -> None:
+        import time as _time
+        self._cb_failures += 1
+        if self._cb_failures >= self._CB_THRESHOLD:
+            self._cb_open_until = _time.time() + self._CB_COOLDOWN_S
+            self._cb_failures = 0
+            logger.warning(
+                "openviking: circuit breaker OPEN for %.0fs (server unreachable at %s)",
+                self._CB_COOLDOWN_S, self._endpoint,
+            )
+
+    def _invalidate_ctx_cache(self) -> None:
+        self._ctx_cache = None
 
     # ── identity / capabilities ──────────────────────────────────────────
 
@@ -284,24 +321,29 @@ class OpenVikingContextEngine(ContextEngine):
     # ── observation / ingest ─────────────────────────────────────────────
 
     def _ingest_new(self, messages: List[Dict[str, Any]]) -> int:
-        """Push messages beyond the watermark to OV. Returns count pushed."""
+        """Push messages beyond the watermark to OV. Returns count pushed.
+
+        The watermark advances per message (not in bulk at the end), so a
+        mid-batch failure leaves it at the exact failure point — the retry
+        on the next turn resumes there with no duplicates and no gaps.
+        """
         if not self._ov_sid:
             return 0
         start = min(self._ingested_count, len(messages))
         pushed = 0
-        for msg in messages[start:]:
+        for i in range(start, len(messages)):
+            msg = messages[i]
             role = msg.get("role")
-            if role not in ("user", "assistant", "tool"):
-                continue
-            text = _message_text(msg)
+            text = _message_text(msg) if role in ("user", "assistant", "tool") else ""
             if not text:
+                self._ingested_count = i + 1  # nothing to push for this entry
                 continue
             # OV session messages use user/assistant roles; tool results ride
             # along as user-role context (same policy as the OpenClaw plugin).
             ov_role = "assistant" if role == "assistant" else "user"
             self._client.add_message(self._ov_sid, ov_role, text[:8000])
+            self._ingested_count = i + 1
             pushed += 1
-        self._ingested_count = len(messages)
         return pushed
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], turn: TurnInfo) -> None:
@@ -311,22 +353,29 @@ class OpenVikingContextEngine(ContextEngine):
             self.on_session_start(turn.session_id)
         snapshot = list(messages)  # engine-side copy; never mutate host list
 
+        if not self._cb_allow():
+            return  # breaker open: skip fast; watermark self-heals next turn
+
         def _work():
             try:
                 pushed = self._ingest_new(snapshot)
+                self._cb_ok()
                 if pushed == 0:
                     return
+                self._invalidate_ctx_cache()
                 info = self._client.get_session(self._ov_sid, auto_create=True)
                 pending = int(info.get("pending_tokens") or 0)
                 if pending >= self._commit_threshold:
                     result = self._client.commit(
                         self._ov_sid, keep_recent_count=self._keep_recent
                     )
+                    self._invalidate_ctx_cache()
                     logger.info(
                         "openviking: threshold commit session=%s pending=%d task=%s",
                         self._ov_sid, pending, result.get("task_id"),
                     )
             except Exception as e:
+                self._cb_fail()
                 logger.warning("openviking on_turn_complete failed: %s", e)
 
         with self._bg_lock:
@@ -339,20 +388,39 @@ class OpenVikingContextEngine(ContextEngine):
 
     # ── request assembly ─────────────────────────────────────────────────
 
+    def _get_overview_cached(self, budget: int) -> str:
+        """Archive overview with per-TTL cache, circuit-breaker guarded.
+
+        The tool loop calls request assembly on EVERY provider dispatch; the
+        overview only changes on ingest/commit (cache invalidated there).
+        """
+        import time as _time
+
+        if self._ctx_cache and _time.time() < self._ctx_cache[0]:
+            return self._ctx_cache[1]
+        if not self._cb_allow():
+            return self._ctx_cache[1] if self._ctx_cache else ""
+        try:
+            ov_ctx = self._client.get_context(self._ov_sid, budget)
+            overview = (ov_ctx.get("latest_archive_overview") or "").strip()
+            self._cb_ok()
+            self._ctx_cache = (_time.time() + self._CTX_CACHE_TTL_S, overview)
+            return overview
+        except Exception as e:
+            self._cb_fail()
+            logger.debug("openviking: context fetch skipped: %s", e)
+            return ""
+
     def prepare_request_messages(
         self, messages: List[Dict[str, Any]], ctx: RequestContext
     ) -> Optional[List[Dict[str, Any]]]:
         if not self._ov_sid:
             return None
         injections: List[str] = []
-        try:
-            budget = ctx.budget_tokens or self.threshold_tokens or 64_000
-            ov_ctx = self._client.get_context(self._ov_sid, budget)
-            overview = (ov_ctx.get("latest_archive_overview") or "").strip()
-            if overview:
-                injections.append(f"{SUMMARY_HEADER}\n{overview}")
-        except Exception as e:
-            logger.debug("openviking: context fetch skipped: %s", e)
+        budget = ctx.budget_tokens or self.threshold_tokens or 64_000
+        overview = self._get_overview_cached(budget)
+        if overview:
+            injections.append(f"{SUMMARY_HEADER}\n{overview}")
         if ctx.prefetch_context:
             recall = "\n".join(str(x) for x in ctx.prefetch_context if x)
             if recall.strip():
@@ -415,6 +483,7 @@ class OpenVikingContextEngine(ContextEngine):
                  ) -> List[Dict[str, Any]]:
         if not self._ov_sid:
             return messages
+        self._invalidate_ctx_cache()
         result = self._client.commit(self._ov_sid, keep_recent_count=0)
         # Compaction must consume the commit's product (the archive overview),
         # so wait for the server task to terminate — rare, already-slow path.
@@ -429,6 +498,7 @@ class OpenVikingContextEngine(ContextEngine):
             logger.warning("openviking: post-commit context fetch failed: %s", e)
         if not overview:
             logger.warning("openviking: archive overview unavailable — degraded rebuild (tail only)")
+        self._invalidate_ctx_cache()  # next assembly reads the fresh post-commit state
         tail = [m for m in messages if m.get("role") in ("user", "assistant")]
         tail = tail[-max(self.protect_last_n, 2):]
         # Drop a leading assistant message to keep user-first alternation.

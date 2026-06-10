@@ -226,3 +226,42 @@ class TestTurnObservation:
         agent._context_engine_caps = None
         result, _ = _run_finalize(agent)
         assert result["final_response"] == "All done."
+
+
+# ── background-review fork isolation (B6) ────────────────────────────────────
+
+
+class TestReviewForkIsolation:
+    def test_review_fork_disables_context_engine_lifecycle(self, monkeypatch):
+        """The internal review fork shares the parent session_id, so an
+        observation-capable engine would ingest the review's internal
+        monologue into the parent conversation's store. The fork must zero
+        out the capability snapshot before running."""
+        from agent.background_review import _run_review_in_thread
+
+        created = []
+
+        def _factory(*args, **kwargs):
+            inst = MagicMock()
+            inst.run_conversation.side_effect = RuntimeError("stop after setup")
+            created.append(inst)
+            return inst
+
+        monkeypatch.setattr("run_agent.AIAgent", _factory)
+        parent = MagicMock()
+        parent._current_main_runtime.return_value = {
+            "api_mode": "chat_completions", "base_url": "", "api_key": "k",
+        }
+        parent.session_id = "parent-sess"
+        parent.model = "m"
+        parent.platform = "cli"
+        parent.provider = "p"
+
+        _run_review_in_thread(parent, [], "review prompt")
+
+        assert created, "review agent was never constructed"
+        caps = created[0]._context_engine_caps
+        assert isinstance(caps, ContextEngineCapabilities)
+        assert caps.observation is False
+        assert caps.request_assembly is False
+        assert caps.lossless_snapshot is False
