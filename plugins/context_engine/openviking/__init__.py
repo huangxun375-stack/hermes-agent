@@ -233,14 +233,32 @@ class OpenVikingContextEngine(ContextEngine):
     # ── session lifecycle ────────────────────────────────────────────────
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        """Bind the OV session to the conversation's lineage root.
+
+        Hermes rotates ``session_id`` on compaction (continuation of the SAME
+        logical conversation) and on /new and /reset (a NEW conversation).
+        The host disambiguates via lineage kwargs: ``lineage_root_id`` is
+        propagated unchanged across compression rotations and regenerated on
+        reset. Binding the OV session to the root therefore gives:
+
+        - compaction rotation -> same OV session (archives accumulate,
+          context stays continuous, ingest watermark survives)
+        - /new and /reset      -> fresh OV session (clean slate, as intended)
+        """
         self._session_id = session_id or ""
-        self._ov_sid = _safe_ov_session_id(session_id) if session_id else ""
+        anchor = kwargs.get("lineage_root_id") or session_id
+        new_ov_sid = _safe_ov_session_id(anchor) if anchor else ""
+        if new_ov_sid != self._ov_sid:
+            # New logical conversation (or first bind): start a fresh watermark.
+            self._ingested_count = 0
+        # Same OV session (e.g. compression rotation): keep the watermark so
+        # the rebuilt window's already-ingested tail is not pushed twice.
+        self._ov_sid = new_ov_sid
         self._lineage = {
             "boundary_reason": kwargs.get("boundary_reason"),
             "lineage_root_id": kwargs.get("lineage_root_id"),
             "old_session_id": kwargs.get("old_session_id"),
         }
-        self._ingested_count = 0
         logger.info(
             "openviking engine bound session=%s ov_sid=%s reason=%s root=%s",
             session_id, self._ov_sid,
@@ -287,7 +305,9 @@ class OpenVikingContextEngine(ContextEngine):
         return pushed
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], turn: TurnInfo) -> None:
-        if not self._ov_sid and turn.session_id:
+        # Defensive rebind: if the host rotated the session without a full
+        # transition notification (e.g. a bare reset path), detect it here.
+        if turn.session_id and turn.session_id != self._session_id:
             self.on_session_start(turn.session_id)
         snapshot = list(messages)  # engine-side copy; never mutate host list
 
@@ -424,7 +444,12 @@ class OpenVikingContextEngine(ContextEngine):
             return messages
         self.compression_count += 1
         self.last_prompt_tokens = -1  # match built-in sentinel until next usage
-        self._ingested_count = 0  # server now owns history; rebuilt window is new
+        # The rebuilt window's contents (summary text + already-ingested tail)
+        # are all known to the OV session — set the watermark past them so the
+        # next turn only ingests genuinely new messages (no duplicates). The
+        # upcoming compression-rotation on_session_start keeps this watermark
+        # because the lineage root (and thus the OV binding) is unchanged.
+        self._ingested_count = len(rebuilt)
         return rebuilt
 
     # ── tools ────────────────────────────────────────────────────────────
