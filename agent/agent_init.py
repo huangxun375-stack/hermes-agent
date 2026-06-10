@@ -1612,6 +1612,12 @@ def init_agent(
                 agent._context_engine_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
 
+    # Lineage root: a fresh agent starts a new logical conversation chain.
+    # The root is propagated unchanged across compression rotations and only
+    # regenerated on reset (see reset_session_state) — so engines can group
+    # rotated sessions under one stable id.
+    agent._lineage_root_id = agent.session_id
+
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:
@@ -1622,6 +1628,8 @@ def init_agent(
                 model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                boundary_reason="new",
+                lineage_root_id=agent._lineage_root_id,
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
