@@ -507,6 +507,19 @@ def compress_context(
             agent._session_db.end_session(agent.session_id, "compression")
             old_session_id = agent.session_id
             agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+            # Lineage: rotation continues the SAME logical conversation —
+            # propagate the root to the new session id and persist the
+            # mapping so a later resume of the rotated id stays continuous.
+            try:
+                _lineage_root = (
+                    getattr(agent, "_lineage_root_id", None)
+                    or agent._load_persisted_lineage_root(old_session_id)
+                    or old_session_id
+                )
+                agent._lineage_root_id = _lineage_root
+                agent._persist_lineage_root(agent.session_id, _lineage_root)
+            except Exception:
+                pass
             # Ordering contract: the agent thread updates the contextvar here;
             # the gateway propagates to SessionEntry after run_in_executor returns.
             try:
@@ -565,6 +578,9 @@ def compress_context(
                 boundary_reason="compression",
                 old_session_id=_old_sid,
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                # Rotation continues the same logical conversation: the
+                # lineage root is propagated, never regenerated here.
+                lineage_root_id=getattr(agent, "_lineage_root_id", None),
             )
     except Exception as _ce_err:
         logger.debug("context engine on_session_start (compression): %s", _ce_err)

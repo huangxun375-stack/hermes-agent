@@ -232,6 +232,46 @@ class TestLegacyBaselineE2E:
 # ── E2E: lineage kwargs ──────────────────────────────────────────────────────
 
 
-# NOTE: lineage E2E tests (boundary_reason / lineage_root_id propagation and
-# reset-root regeneration) ship with the follow-up lineage PR alongside the
-# code they exercise.
+class TestLineageE2E:
+    def test_fresh_agent_gets_new_boundary_and_root(self, monkeypatch):
+        starts = []
+        from agent.context_compressor import ContextCompressor
+
+        monkeypatch.setattr(
+            ContextCompressor, "on_session_start",
+            lambda self, sid, **kw: starts.append((sid, kw)),
+        )
+        agent = _make_agent(monkeypatch, engine=None)
+
+        assert starts, "on_session_start not called during init"
+        sid, kw = starts[-1]
+        assert kw.get("boundary_reason") == "new"
+        assert kw.get("lineage_root_id") == sid == agent._lineage_root_id
+
+    def test_reset_transition_gets_reset_boundary_and_new_root(self, monkeypatch):
+        engine = OVStyleEngine()
+        agent = _make_agent(monkeypatch, engine=engine)
+        old_root = agent._lineage_root_id
+
+        agent.reset_session_state(
+            previous_messages=[{"role": "user", "content": "x"}],
+            old_session_id="old-sess",
+        )
+
+        assert engine.session_starts, "transition did not reach the engine"
+        _, kw = engine.session_starts[-1]
+        assert kw.get("boundary_reason") == "reset"
+        assert kw.get("old_session_id") == "old-sess"
+        # Root regenerated from the current session id after reset.
+        assert agent._lineage_root_id == agent.session_id
+
+    def test_bare_reset_stays_reset_only(self, monkeypatch):
+        engine = OVStyleEngine()
+        agent = _make_agent(monkeypatch, engine=engine)
+        engine.session_starts.clear()
+
+        agent.reset_session_state()  # bare: no transition kwargs
+
+        assert engine.session_starts == [], (
+            "bare reset must not fire on_session_start (reset-only contract)"
+        )

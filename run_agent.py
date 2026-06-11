@@ -530,6 +530,30 @@ class AIAgent:
                 "Session DB creation failed (will retry next turn): %s", e
             )
 
+    def _load_persisted_lineage_root(self, session_id: str) -> Optional[str]:
+        """Read the persisted lineage root for a session (None if unknown).
+
+        Storage: SessionDB meta kv (``lineage_root:<session_id>``). Keeps the
+        logical-conversation root stable across process restarts and resumes,
+        so context engines can re-bind continuously after compaction rotations.
+        """
+        try:
+            db = getattr(self, "_session_db", None)
+            if db and session_id:
+                return db.get_meta(f"lineage_root:{session_id}") or None
+        except Exception:
+            pass
+        return None
+
+    def _persist_lineage_root(self, session_id: str, root: Optional[str]) -> None:
+        """Persist session->lineage-root mapping (fail-open)."""
+        try:
+            db = getattr(self, "_session_db", None)
+            if db and session_id and root:
+                db.set_meta(f"lineage_root:{session_id}", root)
+        except Exception as exc:
+            logger.debug("lineage root persist failed for %s: %s", session_id, exc)
+
     def _transition_context_engine_session(
         self,
         *,
@@ -580,6 +604,10 @@ class AIAgent:
                 "model": getattr(self, "model", ""),
                 "context_length": getattr(engine, "context_length", None),
                 "conversation_id": getattr(self, "_gateway_session_key", None),
+                # Lineage: stable root of the logical conversation chain.
+                # Set at first session creation, propagated (not regenerated)
+                # across compression rotations; reset on /new and /reset.
+                "lineage_root_id": getattr(self, "_lineage_root_id", None),
             }
             start_context.update(extra_context)
             start_context = {k: v for k, v in start_context.items() if v not in (None, "")}
@@ -643,13 +671,27 @@ class AIAgent:
         self._user_turn_count = 0
 
         # Context engine reset/transition (works for built-in compressor and plugins)
+        # boundary_reason only joins full transitions: extra kwargs flip the
+        # ``should_start`` gate inside _transition_context_engine_session, so
+        # bare resets (no old session / previous messages / carry-over) must
+        # stay kwargs-free to keep their reset-only contract.
+        _lineage_extra = {}
+        if old_session_id or previous_messages is not None or carry_over_context:
+            _lineage_extra["boundary_reason"] = "reset"
         self._transition_context_engine_session(
             old_session_id=old_session_id,
             new_session_id=getattr(self, "session_id", None),
             previous_messages=previous_messages,
             carry_over_context=carry_over_context,
             reset_engine=True,
+            **_lineage_extra,
         )
+        # A reset starts a new logical conversation chain: regenerate the
+        # lineage root from the (possibly rotated) current session id and
+        # persist the new mapping.
+        self._lineage_root_id = getattr(self, "session_id", None)
+        if self._lineage_root_id:
+            self._persist_lineage_root(self._lineage_root_id, self._lineage_root_id)
 
     def _ensure_lmstudio_runtime_loaded(self, config_context_length: Optional[int] = None) -> None:
         """

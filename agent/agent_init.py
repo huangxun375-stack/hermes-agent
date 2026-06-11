@@ -1612,6 +1612,19 @@ def init_agent(
                 agent._context_engine_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
 
+    # Lineage root: the stable id of the logical conversation chain.
+    # Resume path: a persisted mapping exists (this session id was seen
+    # before — possibly created by a compaction rotation in a previous
+    # process) — reuse its root so engines re-bind continuously.
+    # Fresh path: this session starts a new chain; root = own session id.
+    # The mapping lives in SessionDB meta kv and is extended on every
+    # rotation (compression) and reset, so it survives process restarts.
+    _persisted_root = agent._load_persisted_lineage_root(agent.session_id)
+    agent._lineage_root_id = _persisted_root or agent.session_id
+    _lineage_boundary = "resume" if _persisted_root else "new"
+    if not _persisted_root:
+        agent._persist_lineage_root(agent.session_id, agent._lineage_root_id)
+
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:
@@ -1622,6 +1635,8 @@ def init_agent(
                 model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                boundary_reason=_lineage_boundary,
+                lineage_root_id=agent._lineage_root_id,
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
