@@ -298,6 +298,92 @@ class TestCompaction:
         assert SUMMARY_HEADER in rebuilt[0]["content"]
 
 
+# ── compression-rotation interplay: end-flush must not duplicate ─────────────
+
+
+class TestCompressionRotationInterplay:
+    """Regression for the watermark index-space collision.
+
+    compress() rebases the watermark into the REBUILT window's index space;
+    the host's compression transition then calls on_session_end with the OLD
+    window. Without the one-shot marker this re-pushed the old tail
+    (duplicates), committed a second archive, and left the watermark above
+    the new window length — silently freezing per-turn ingest.
+    """
+
+    def _compress_ready_engine(self):
+        eng = make_engine()
+        eng.on_session_start("root-1", boundary_reason="new",
+                             lineage_root_id="root-1")
+        eng._client.commit.return_value = {"task_id": "t-1"}
+        eng._client.get_task.return_value = {"status": "completed"}
+        eng._client.get_context.return_value = {
+            "latest_archive_overview": "the summary"}
+        return eng
+
+    @staticmethod
+    def _long_window(pairs=6):
+        texts = []
+        for i in range(pairs):
+            texts += [f"u{i}", f"a{i}"]
+        return msgs(*texts, roles=["user", "assistant"] * pairs)
+
+    def test_session_end_after_compress_skips_flush_and_commit(self):
+        eng = self._compress_ready_engine()
+        # Old window LONGER than the rebuilt window (summary pair + tail) so
+        # the unfixed index-space collision would actually re-push.
+        old = self._long_window(pairs=6)            # 12 messages
+        run_turn(eng, old, session_id="root-1")
+        pushes_before = eng._client.add_message.call_count
+        rebuilt = eng.compress(old)                  # rebased watermark
+        assert len(rebuilt) < len(old)
+        assert eng._client.commit.call_count == 1
+        # Host compression transition: end(old) -> start(new, same root).
+        eng.on_session_end("root-1", old)
+        assert eng._client.add_message.call_count == pushes_before  # no re-push
+        assert eng._client.commit.call_count == 1                   # no 2nd commit
+        eng.on_session_start("rot-2", boundary_reason="compression",
+                             lineage_root_id="root-1",
+                             old_session_id="root-1")
+        # Fingerprint assertion: the turn after rotation must ingest its NEW
+        # messages (wm_delta > 0), exactly and only them.
+        window = rebuilt + msgs("u-new", "a-new")
+        run_turn(eng, window, session_id="rot-2")
+        assert eng._ingested_count - len(rebuilt) == 2
+        assert eng._client.add_message.call_count == pushes_before + 2
+
+    def test_real_session_end_still_flushes_and_commits(self):
+        """Guard: a session end NOT preceded by compress keeps full behavior."""
+        eng = self._compress_ready_engine()
+        eng.on_session_end("root-1", msgs("u", "a"))
+        assert eng._client.add_message.call_count == 2
+        eng._client.commit.assert_called_once()
+
+    def test_marker_is_one_shot(self):
+        """A later REAL end of the same session must flush+commit again."""
+        eng = self._compress_ready_engine()
+        old = self._long_window(pairs=6)
+        run_turn(eng, old, session_id="root-1")
+        eng.compress(old)
+        eng.on_session_end("root-1", old)            # consumed: skip
+        commits_after_skip = eng._client.commit.call_count
+        eng.on_session_end("root-1", old)            # real end later: commit
+        assert eng._client.commit.call_count == commits_after_skip + 1
+
+    def test_aborted_compress_does_not_arm_marker(self):
+        """Abort paths must leave session-end flush semantics untouched."""
+        eng = self._compress_ready_engine()
+        eng._client.commit.side_effect = RuntimeError("server down")
+        old = self._long_window(pairs=2)
+        out = eng.compress(old)
+        assert out is old and eng._last_compress_aborted
+        assert eng._just_compacted_session == ""
+        eng._client.commit.side_effect = None
+        eng._cb_open_until = 0
+        eng.on_session_end("root-1", old)            # normal flush+commit
+        assert eng._client.commit.call_count >= 1
+
+
 # ── tools ────────────────────────────────────────────────────────────────────
 
 

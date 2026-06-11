@@ -202,6 +202,17 @@ class OpenVikingContextEngine(ContextEngine):
         # Ingest watermark: count of messages already pushed to OV for the
         # bound session. Re-entry at the same watermark is a no-op.
         self._ingested_count = 0
+        # One-shot marker: session id whose live content compress() just
+        # archived. The host's compression-rotation transition calls
+        # on_session_end(old_sid, OLD-window messages) right after
+        # compress() returns, but by then compress() has already flushed
+        # (via on_pre_compress) and committed that content AND rebased the
+        # watermark into the REBUILT window's index space. Flushing the OLD
+        # list against the rebased watermark would re-push the old tail
+        # (duplicates in OV), commit a second archive, and leave the
+        # watermark above the new window length — silently freezing
+        # per-turn ingest. on_session_end consumes this marker and skips.
+        self._just_compacted_session: str = ""
         self._bg_lock = threading.Lock()
         self._bg_thread: Optional[threading.Thread] = None
         # Circuit breaker: when the OV server is unreachable, hooks must
@@ -296,6 +307,9 @@ class OpenVikingContextEngine(ContextEngine):
             t.join(timeout=10.0)
 
         self._session_id = session_id or ""
+        # A rebind means any pending compression transition has completed (or
+        # the conversation changed) — a lingering marker is stale by now.
+        self._just_compacted_session = ""
         anchor = kwargs.get("lineage_root_id") or session_id
         new_ov_sid = _safe_ov_session_id(anchor) if anchor else ""
         if new_ov_sid != self._ov_sid:
@@ -318,6 +332,17 @@ class OpenVikingContextEngine(ContextEngine):
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Flush remaining messages and commit at real session boundaries."""
+        if session_id and session_id == self._just_compacted_session:
+            # Compression-rotation boundary: compress() already archived this
+            # session's content (on_pre_compress flushed, compress committed)
+            # and rebased the watermark to the rebuilt window. Flushing the
+            # OLD window here would duplicate messages, double-commit, and
+            # freeze per-turn ingest (watermark > new window length).
+            self._just_compacted_session = ""
+            logger.info(
+                "openviking: session %s end follows in-engine compaction — "
+                "already flushed+committed, skipping end-flush", session_id)
+            return
         try:
             self._ingest_new(messages)
             if self._ingested_count > 0 and self._ov_sid:
@@ -499,6 +524,7 @@ class OpenVikingContextEngine(ContextEngine):
         # "return input unchanged + _last_compress_aborted" is the sanctioned
         # abort path that skips session rotation cleanly. Never raise here.
         self._last_compress_aborted = False
+        self._just_compacted_session = ""  # fresh attempt; set only on success
         if not self._ov_sid:
             self._last_compress_aborted = True
             return messages
@@ -548,6 +574,11 @@ class OpenVikingContextEngine(ContextEngine):
         # upcoming compression-rotation on_session_start keeps this watermark
         # because the lineage root (and thus the OV binding) is unchanged.
         self._ingested_count = len(rebuilt)
+        # Arm the one-shot marker: the imminent compression-rotation
+        # transition will call on_session_end(this session) — that end-flush
+        # must be skipped (content already archived; watermark already
+        # rebased to the rebuilt window's index space).
+        self._just_compacted_session = self._session_id
         return rebuilt
 
     # ── tools ────────────────────────────────────────────────────────────
