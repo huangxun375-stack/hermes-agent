@@ -518,8 +518,13 @@ def compress_context(
                 )
                 agent._lineage_root_id = _lineage_root
                 agent._persist_lineage_root(agent.session_id, _lineage_root)
-            except Exception:
-                pass
+            except Exception as _lineage_exc:
+                # Fail-open: a lineage bookkeeping hiccup must never block the
+                # compression rotation itself.
+                logger.debug(
+                    "lineage root propagation failed (%s -> %s): %s",
+                    old_session_id, agent.session_id, _lineage_exc,
+                )
             # Ordering contract: the agent thread updates the contextvar here;
             # the gateway propagates to SessionEntry after run_in_executor returns.
             try:

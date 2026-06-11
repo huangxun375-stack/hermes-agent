@@ -541,8 +541,8 @@ class AIAgent:
             db = getattr(self, "_session_db", None)
             if db and session_id:
                 return db.get_meta(f"lineage_root:{session_id}") or None
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("lineage root load failed for %s: %s", session_id, exc)
         return None
 
     def _persist_lineage_root(self, session_id: str, root: Optional[str]) -> None:
